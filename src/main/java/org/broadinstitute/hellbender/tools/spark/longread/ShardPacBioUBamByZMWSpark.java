@@ -1,11 +1,26 @@
 package org.broadinstitute.hellbender.tools.spark.longread;
 
+import htsjdk.samtools.SAMFileHeader;
+import htsjdk.samtools.SAMRecord;
+import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaSparkContext;
+import org.broadinstitute.barclay.argparser.Advanced;
+import org.broadinstitute.barclay.argparser.Argument;
 import org.broadinstitute.barclay.argparser.BetaFeature;
 import org.broadinstitute.barclay.argparser.CommandLineProgramProperties;
 import org.broadinstitute.barclay.help.DocumentedFeature;
+import org.broadinstitute.hellbender.cmdline.StandardArgumentDefinitions;
 import org.broadinstitute.hellbender.cmdline.programgroups.LongReadAnalysisProgramGroup;
+import org.broadinstitute.hellbender.engine.filters.ReadFilter;
+import org.broadinstitute.hellbender.engine.filters.ReadFilterLibrary;
 import org.broadinstitute.hellbender.engine.spark.GATKSparkTool;
+import org.broadinstitute.hellbender.tools.spark.sv.utils.SVFileUtils;
+import scala.Tuple2;
+
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
+import java.util.stream.StreamSupport;
 
 /**
  * Subsets reads by name (basically a parallel version of "grep -f", or "grep -vf")
@@ -51,8 +66,56 @@ import org.broadinstitute.hellbender.engine.spark.GATKSparkTool;
 public class ShardPacBioUBamByZMWSpark extends GATKSparkTool {
     private static final long serialVersionUID = 1L;
 
+
+    private static final String ZMW_ATRRIBUTE_KEY = "zm";
+
+
+    @Argument(doc = "the output prefix", shortName = StandardArgumentDefinitions.OUTPUT_SHORT_NAME,
+            fullName = StandardArgumentDefinitions.OUTPUT_LONG_NAME)
+    protected String output;
+
+    @Advanced
+    @Argument(doc = "count of ZMWs in one shard output bam", fullName = "shard-size", optional = true)
+    protected Integer shardSize = 20_000;
+
+    @Override
+    public boolean requiresReads() {
+        return true;
+    }
+
+    @Override
+    public List<ReadFilter> getDefaultReadFilters() {
+        return Arrays.asList(new ReadFilterLibrary.AllowAllReadsReadFilter());
+    }
+
+
+
     @Override
     protected void runTool( final JavaSparkContext ctx ) {
 
+        final SAMFileHeader headerForReads = getHeaderForReads();
+
+        JavaPairRDD<String, Iterable<SAMRecord>> readsGroupedByZMW =
+                getUnfilteredReads().map(read -> read.convertToSAMRecord(headerForReads))
+                        .groupBy(read -> read.getStringAttribute(ZMW_ATRRIBUTE_KEY));
+
+        JavaPairRDD<Integer, Iterable<Tuple2<String, Iterable<SAMRecord>>>> clusteredByShard =
+                readsGroupedByZMW
+                        .mapToPair(pair -> {
+                            final Integer zmw = new Integer(pair._1);
+                            int idx = zmw / shardSize;
+                            return new Tuple2<>(idx, pair);
+                        })
+                        .groupByKey();
+
+        clusteredByShard.foreach(cluster -> {
+
+            final String name = output + cluster._1;
+            final Iterator<SAMRecord> readsInThisCluster = StreamSupport.stream(cluster._2.spliterator(), false)
+                    .flatMap(i -> StreamSupport.stream(i._2.spliterator(), false))
+                    .iterator();
+            SVFileUtils.writeSAMFile(name, readsInThisCluster, headerForReads, false);
+
+        });
     }
 }
